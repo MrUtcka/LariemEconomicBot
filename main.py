@@ -6,11 +6,14 @@ import random
 import sys
 import io
 import os
+from typing import Optional
 from dotenv import load_dotenv
 from discord.ext import commands
 from discord import app_commands
+from datetime import datetime, timedelta
 
-# --- Исправление кодировки для Windows ---
+# --- НАСТРОЙКА ---
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -18,7 +21,6 @@ if sys.platform == "win32":
     except AttributeError:
         pass
 
-# --- Настройки Бота ---
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -33,11 +35,9 @@ bot = MyBot()
 DB_NAME = "economy.db"
 active_events = {}
 
-# --- Настройки Казино (Slots) ---
 SLOTS_WEIGHTED = (["🍋"] * 10 + ["🍎"] * 8 + ["🍒"] * 5 + ["💎"] * 2 + ["7️⃣"] * 1)
-SLOT_PAYOUTS = {"🍋": 3, "🍎": 5, "🍒": 10, "💎": 25, "7️⃣": 50}
+SLOT_PAYOUTS = {"🍋": 2, "🍎": 3, "🍒": 5, "💎": 10, "7️⃣": 20}
 
-# --- Функции Базы Данных ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -57,6 +57,38 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS saved_events (
                 guild_id INTEGER, event_id INTEGER, data TEXT,
                 PRIMARY KEY (guild_id, event_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS shop_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER, name TEXT, description TEXT, price INTEGER,
+                item_type TEXT, role_id INTEGER, is_one_time BOOLEAN DEFAULT 1,
+                UNIQUE(guild_id, name)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, guild_id INTEGER, item_id INTEGER,
+                quantity INTEGER DEFAULT 1,
+                UNIQUE(user_id, guild_id, item_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS one_time_purchases (
+                user_id INTEGER, guild_id INTEGER, item_id INTEGER,
+                PRIMARY KEY (user_id, guild_id, item_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                code TEXT PRIMARY KEY,
+                reward INTEGER NOT NULL,
+                expires_at DATETIME,
+                created_by INTEGER,
+                redeemed_by INTEGER,
+                redeemed_at DATETIME
             )
         """)
         await db.commit()
@@ -86,8 +118,113 @@ async def update_balance(user_id, guild_id, amount):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ? AND guild_id = ?", (int(amount), user_id, guild_id))
         await db.commit()
+        
+async def add_item_to_inventory(user_id, guild_id, item_id, quantity=1):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT quantity FROM inventory WHERE user_id = ? AND guild_id = ? AND item_id = ?",
+            (user_id, guild_id, item_id)
+        )
+        row = await cursor.fetchone()
+        
+        if row:
+            await db.execute(
+                "UPDATE inventory SET quantity = quantity + ? WHERE user_id = ? AND guild_id = ? AND item_id = ?",
+                (quantity, user_id, guild_id, item_id)
+            )
+        else:
+            await db.execute(
+                "INSERT INTO inventory (user_id, guild_id, item_id, quantity) VALUES (?, ?, ?, ?)",
+                (user_id, guild_id, item_id, quantity)
+            )
+        await db.commit()
 
-# --- ВСЕ КОМАНДЫ (SLASH) ---
+async def remove_item_from_inventory(user_id, guild_id, item_id, quantity=1):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT quantity FROM inventory WHERE user_id = ? AND guild_id = ? AND item_id = ?",
+            (user_id, guild_id, item_id)
+        )
+        row = await cursor.fetchone()
+        
+        if row and row[0] >= quantity:
+            if row[0] == quantity:
+                await db.execute(
+                    "DELETE FROM inventory WHERE user_id = ? AND guild_id = ? AND item_id = ?",
+                    (user_id, guild_id, item_id)
+                )
+            else:
+                await db.execute(
+                    "UPDATE inventory SET quantity = quantity - ? WHERE user_id = ? AND guild_id = ? AND item_id = ?",
+                    (quantity, user_id, guild_id, item_id)
+                )
+            await db.commit()
+            return True
+        return False
+
+async def get_user_inventory(user_id, guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("""
+            SELECT si.item_id, si.name, si.description, inv.quantity, si.item_type, si.role_id
+            FROM inventory inv
+            JOIN shop_items si ON inv.item_id = si.item_id
+            WHERE inv.user_id = ? AND inv.guild_id = ?
+            ORDER BY si.name
+        """, (user_id, guild_id))
+        return await cursor.fetchall()
+
+async def get_shop_items(guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT item_id, name, description, price, item_type, role_id, is_one_time FROM shop_items WHERE guild_id = ? ORDER BY name",
+            (guild_id,)
+        )
+        return await cursor.fetchall()
+
+async def get_shop_item(item_id, guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT item_id, name, description, price, item_type, role_id, is_one_time FROM shop_items WHERE item_id = ? AND guild_id = ?",
+            (item_id, guild_id)
+        )
+        return await cursor.fetchone()
+
+async def create_shop_item(guild_id, name, description, price, item_type, role_id=None, is_one_time=False):
+    async with aiosqlite.connect(DB_NAME) as db:
+        try:
+            cursor = await db.execute(
+                "INSERT INTO shop_items (guild_id, name, description, price, item_type, role_id, is_one_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (guild_id, name, description, price, item_type, role_id, is_one_time)
+            )
+            await db.commit()
+            return cursor.lastrowid
+        except aiosqlite.IntegrityError:
+            return None
+
+async def delete_shop_item(item_id, guild_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM shop_items WHERE item_id = ? AND guild_id = ?", (item_id, guild_id))
+        await db.execute("DELETE FROM inventory WHERE item_id = ? AND guild_id = ?", (item_id, guild_id))
+        await db.execute("DELETE FROM one_time_purchases WHERE item_id = ? AND guild_id = ?", (item_id, guild_id))
+        await db.commit()
+
+async def is_one_time_purchased(user_id, guild_id, item_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM one_time_purchases WHERE user_id = ? AND guild_id = ? AND item_id = ?",
+            (user_id, guild_id, item_id)
+        )
+        return await cursor.fetchone() is not None
+
+async def mark_one_time_purchased(user_id, guild_id, item_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO one_time_purchases (user_id, guild_id, item_id) VALUES (?, ?, ?)",
+            (user_id, guild_id, item_id)
+        )
+        await db.commit()
+
+# --- СНОВНЫЕ КОМАНДЫ ---
 
 # 0. HELP
 @bot.tree.command(name="help", description="Показать список всех команд")
@@ -98,8 +235,17 @@ async def help_command(interaction: discord.Interaction):
         "`/balance` — Проверить счет\n"
         "`/slots [сумма]` — Играть в казино\n"
         "`/events` — Список активных матчей\n"
-        "`/bet [id_события] [выбор] [сумма]` — Сделать ставку"
+        "`/bet [id_события] [выбор] [сумма]` — Сделать ставку\n"
+        "`/pay [пользователь] [сумма]` — Передать деньги"
     ), inline=False)
+
+    embed.add_field(name="🛍️ Магазин", value=(
+        "`/shop` — Просмотреть товары магазина\n"
+        "`/inventory` — Посмотреть инвентарь\n"
+        "`/buy [id_товара]` — Купить товар"
+    ), inline=False)
+    
+    embed.add_field(name="🎁 Промо", value="`/promo [код]` — активировать промокод и получить награду", inline=False)
 
     if interaction.user.guild_permissions.administrator:
         embed.add_field(name="🛡️ Администрирование", value=(
@@ -111,6 +257,20 @@ async def help_command(interaction: discord.Interaction):
             "`/settle [id_события] [победитель]` — Выплатить выигрыши\n"
             "`/give [пользователь] [сумма]` — Выдать Лоресиков\n"
             "`/remove [пользователь] [сумма]` — Забрать Лоресиков"
+        ), inline=False)
+
+        embed.add_field(name="🏪 Управление магазином", value=(
+            "`/create_item` — Создать товар\n"
+            "`/create_role_item` — Создать товар-роль\n"
+            "`/delete_item [id]` — Удалить товар\n"
+            "`/give_item [пользователь] [id_товара] [кол-во]` — Выдать товар\n"
+            "`/take_item [пользователь] [id_товара] [кол-во]` — Забрать товар"
+        ), inline=False)
+        
+        embed.add_field(name="🎁 Промокоды", value=(
+            "`/create_promo [код] [сумма] [дата_время (опц)]` — создать промокод\n"
+            "`/delete_promo [код]` — удалить промокод\n"
+            "`/list_promos` — посмотреть все промокоды"
         ), inline=False)
     
     await interaction.response.send_message(embed=embed)
@@ -143,16 +303,17 @@ async def slots(interaction: discord.Interaction, сумма: int):
         msg = "❌ Проигрыш."
 
     embed = discord.Embed(title="Игровой автомат", description=f"**[ {line} ]**\n\n{msg}", color=discord.Color.orange())
+    
     await interaction.edit_original_response(content=None, embed=embed)
 
 # 3. EVENTS
-@bot.tree.command(name="events", description="Список событий или полная информация по ID")
+@bot.tree.command(name="events", description="Список событий")
 async def events(interaction: discord.Interaction, id_события: int = None):
     evs = active_events.get(interaction.guild.id, {})
     
     if id_события is None:
         if not evs: 
-            return await interaction.response.send_message("Нет активных событий.", ephemeral=True)
+            return await interaction.response.send_message("Не�� активных событий.", ephemeral=True)
         
         embed = discord.Embed(title="📅 Активные события", color=discord.Color.blue())
         for eid, data in evs.items():
@@ -221,7 +382,7 @@ async def bet(interaction: discord.Interaction, id_события: int, выбо
     await interaction.response.send_message(f"✅ Ставка `{сумма}` на **{выбор}** принята!")
 
 # 5. CREATE_MATCH
-@bot.tree.command(name="create_match", description="Админ: Создать матч с составами")
+@bot.tree.command(name="create_match", description="Админ: Создать матч")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_match(interaction: discord.Interaction, команда1: str, ростер1: str, кэф1: float, команда2: str, ростер2: str, кэф2: float):
     eid = (max(active_events.get(interaction.guild.id, {}).keys()) if active_events.get(interaction.guild.id, {}) else 0) + 1
@@ -252,7 +413,7 @@ async def create_match(interaction: discord.Interaction, команда1: str, �
     await interaction.response.send_message(embed=embed)
 
 # 6. CREATE_MVP
-@bot.tree.command(name="create_mvp", description="Админ: Ставка на MVP с разными коэффициентами")
+@bot.tree.command(name="create_mvp", description="Админ: Ставка на MVP")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_mvp(interaction: discord.Interaction, название: str, данные: str):
     guild_id = interaction.guild.id
@@ -308,7 +469,7 @@ async def create_mvp(interaction: discord.Interaction, название: str, д
     await interaction.response.send_message(embed=embed)
 
 # 7. CREATE_TOTAL
-@bot.tree.command(name="create_total", description="Админ: Создать тотал (Больше/Меньше)")
+@bot.tree.command(name="create_total", description="Админ: Создать тотал")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_total(interaction: discord.Interaction, описание: str, кэф_бол: float, кэф_мен: float):
     eid = (max(active_events.get(interaction.guild.id, {}).keys()) if active_events.get(interaction.guild.id, {}) else 0) + 1
@@ -349,7 +510,7 @@ async def unlock(interaction: discord.Interaction, id_события: int):
         await interaction.response.send_message(f"🔓 Ставки на #{id_события} открыты.")
 
 # 10. SETTLE
-@bot.tree.command(name="settle", description="Админ: Завершить событие и выплатить выигрыши")
+@bot.tree.command(name="settle", description="Админ: Завершить событие")
 @app_commands.checks.has_permissions(administrator=True)
 async def settle(interaction: discord.Interaction, id_события: int, победитель: str):
     guild_id = interaction.guild.id
@@ -457,7 +618,396 @@ async def pay(interaction: discord.Interaction, получатель: discord.Me
     embed.add_field(name="Сумма", value=f"`{колво}` Лоресиков", inline=True)
     embed.set_footer(text=f"ID отправителя: {sender_id}")
 
-    await interaction.response.send_message(content=f"{получатель.mention}, вам подарок!", embed=embed)    
+    await interaction.response.send_message(content=f"{получатель.mention}, вам подарок!", embed=embed)
+
+# 14. SHOP
+@bot.tree.command(name="shop", description="Просмотреть магазин")
+async def shop(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    items = await get_shop_items(guild_id)
+    
+    if not items:
+        return await interaction.response.send_message("❌ Магазин пуст.", ephemeral=True)
+    
+    embed = discord.Embed(title="🏪 Магазин товаров", color=discord.Color.purple())
+    
+    for item_id, name, description, price, item_type, role_id, is_one_time in items:
+        one_time_badge = "🔴 Одноразовый" if is_one_time else ""
+        type_emoji = "🎁" if item_type == "item" else "👑"
+        value = f"{description}\n💰 Цена: `{price}` Лоресиков\n{one_time_badge}"
+        embed.add_field(name=f"{type_emoji} {name} (ID: {item_id})", value=value, inline=False)
+    
+    embed.set_footer(text="Чтобы купить товар: /buy [id]")
+    await interaction.response.send_message(embed=embed)
+
+# 15. INVENTORY
+@bot.tree.command(name="inventory", description="Посмотреть инвентарь")
+async def inventory(interaction: discord.Interaction, пользователь: discord.Member = None):
+    target = пользователь or interaction.user
+    guild_id = interaction.guild.id
+    
+    inv = await get_user_inventory(target.id, guild_id)
+    
+    if not inv:
+        return await interaction.response.send_message(f"❌ Инвентарь {target.display_name} пуст.", ephemeral=True)
+    
+    embed = discord.Embed(title=f"🎒 Инвентарь {target.display_name}", color=discord.Color.blue())
+    
+    for item_id, name, description, quantity, item_type, role_id in inv:
+        type_emoji = "🎁" if item_type == "item" else "👑"
+        embed.add_field(
+            name=f"{type_emoji} {name} (ID: {item_id})", 
+            value=f"Количество: `{quantity}`", 
+            inline=False
+        )
+    
+    embed.set_footer(text="Покупайте еще товары в /shop")
+    await interaction.response.send_message(embed=embed)
+
+# 16. BUY
+@bot.tree.command(name="buy", description="Купить товар")
+async def buy(interaction: discord.Interaction, id_товара: int):
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+    
+    item = await get_shop_item(id_товара, guild_id)
+    if not item:
+        return await interaction.response.send_message("❌ Товар не найден.", ephemeral=True)
+    
+    item_id, name, description, price, item_type, role_id, is_one_time = item
+    
+    if is_one_time:
+        already_bought = await is_one_time_purchased(user_id, guild_id, item_id)
+        if already_bought:
+            return await interaction.response.send_message(f"❌ Вы уже купили этот товар! Он одноразовый.", ephemeral=True)
+    
+    balance = await get_balance(user_id, guild_id)
+    if balance < price:
+        return await interaction.response.send_message(
+            f"❌ Недостаточно средств! Нужно {price}, у вас {balance}.", 
+            ephemeral=True
+        )
+    
+    await update_balance(user_id, guild_id, -price)
+    await add_item_to_inventory(user_id, guild_id, item_id, 1)
+    
+    role_given = False
+    if item_type == "role" and role_id:
+        try:
+            role = interaction.guild.get_role(role_id)
+            if role and role not in interaction.user.roles:
+                await interaction.user.add_roles(role)
+                role_given = True
+        except Exception as e:
+            pass
+    
+    if is_one_time:
+        await mark_one_time_purchased(user_id, guild_id, item_id)
+    
+    embed = discord.Embed(
+        title="✅ Покупка успешна!",
+        description=f"Вы купили **{name}**",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Описание", value=description, inline=False)
+    embed.add_field(name="Цена", value=f"`{price}` Лоресиков", inline=True)
+    embed.add_field(name="Новый баланс", value=f"`{balance - price}` Лоресиков", inline=True)
+    if role_given:
+        embed.add_field(name="👑 Роль выдана!", value=role.mention, inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 17. CREATE_ITEM
+@bot.tree.command(name="create_item", description="Админ: Создать товар")
+@app_commands.checks.has_permissions(administrator=True)
+async def create_item(interaction: discord.Interaction, название: str, описание: str, цена: int, одноразовый: bool = False):
+    guild_id = interaction.guild.id
+    
+    if цена <= 0:
+        return await interaction.response.send_message("❌ Цена должна быть больше 0.", ephemeral=True)
+    
+    item_id = await create_shop_item(guild_id, название, описание, цена, "item", None, одноразовый)
+    
+    if not item_id:
+        return await interaction.response.send_message(f"❌ Товар с названием '{название}' уже существует.", ephemeral=True)
+    
+    one_time_text = "🔴 Одноразовый товар" if одноразовый else "♻️ Многоразовый товар"
+    
+    embed = discord.Embed(
+        title="✅ Товар создан!",
+        description=f"Товар '{название}' успешно добавлен в магазин",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ID товара", value=f"`{item_id}`", inline=True)
+    embed.add_field(name="Название", value=название, inline=True)
+    embed.add_field(name="Описание", value=описание, inline=False)
+    embed.add_field(name="Цена", value=f"`{цена}` Лоресиков", inline=True)
+    embed.add_field(name="Тип", value=one_time_text, inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 18. CREATE_ROLE_ITEM
+@bot.tree.command(name="create_role_item", description="Админ: Создать товар-роль")
+@app_commands.checks.has_permissions(administrator=True)
+async def create_role_item(interaction: discord.Interaction, название: str, описание: str, цена: int, роль: discord.Role, одноразовый: bool = False):
+    guild_id = interaction.guild.id
+    
+    if цена <= 0:
+        return await interaction.response.send_message("❌ Цена должна быть больше 0.", ephemeral=True)
+    
+    item_id = await create_shop_item(guild_id, название, описание, цена, "role", роль.id, одноразовый)
+    
+    if not item_id:
+        return await interaction.response.send_message(f"❌ Товар с названием '{название}' уже существует.", ephemeral=True)
+    
+    one_time_text = "🔴 Одноразовый товар" if одноразовый else "♻️ Многоразовый товар"
+    
+    embed = discord.Embed(
+        title="✅ Товар-роль создан!",
+        description=f"Товар '{название}' успешно добавлен в магазин",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="ID товара", value=f"`{item_id}`", inline=True)
+    embed.add_field(name="Название", value=название, inline=True)
+    embed.add_field(name="Описание", value=описание, inline=False)
+    embed.add_field(name="Цена", value=f"`{цена}` Лоресиков", inline=True)
+    embed.add_field(name="Роль", value=роль.mention, inline=True)
+    embed.add_field(name="Тип", value=one_time_text, inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 19. DELETE_ITEM
+@bot.tree.command(name="delete_item", description="Админ: Удалить товар")
+@app_commands.checks.has_permissions(administrator=True)
+async def delete_item(interaction: discord.Interaction, id_товара: int):
+    guild_id = interaction.guild.id
+    
+    item = await get_shop_item(id_товара, guild_id)
+    if not item:
+        return await interaction.response.send_message("❌ Товар не найден.", ephemeral=True)
+    
+    item_id, name, description, price, item_type, role_id, is_one_time = item
+    
+    await delete_shop_item(id_товара, guild_id)
+    
+    embed = discord.Embed(
+        title="✅ Товар удален!",
+        description=f"Товар '{name}' удален из магазина",
+        color=discord.Color.green()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+# 20. GIVE_ITEM
+@bot.tree.command(name="give_item", description="Админ: Выдать товар пользователю")
+@app_commands.checks.has_permissions(administrator=True)
+async def give_item(interaction: discord.Interaction, пользователь: discord.Member, id_товара: int, кол_во: int = 1):
+    guild_id = interaction.guild.id
+    
+    item = await get_shop_item(id_товара, guild_id)
+    if not item:
+        return await interaction.response.send_message("❌ Товар не найден.", ephemeral=True)
+    
+    item_id, name, description, price, item_type, role_id, is_one_time = item
+    
+    if кол_во <= 0:
+        return await interaction.response.send_message("❌ Количество должно быть больше 0.", ephemeral=True)
+    
+    if is_one_time and кол_во > 1:
+        кол_во = 1
+    
+    await add_item_to_inventory(пользователь.id, guild_id, item_id, кол_во)
+    
+    if item_type == "role" and role_id:
+        try:
+            role = interaction.guild.get_role(role_id)
+            if role and role not in пользователь.roles:
+                await пользователь.add_roles(role)
+        except:
+            pass
+    
+    embed = discord.Embed(
+        title="✅ Товар выдан!",
+        description=f"Товар '{name}' выдан пользователю {пользователь.mention}",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Количество", value=f"`{кол_во}`", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 21. TAKE_ITEM
+@bot.tree.command(name="take_item", description="Админ: Забрать товар у пользователя")
+@app_commands.checks.has_permissions(administrator=True)
+async def take_item(interaction: discord.Interaction, пользователь: discord.Member, id_товара: int, кол_во: int = 1):
+    guild_id = interaction.guild.id
+    
+    item = await get_shop_item(id_товара, guild_id)
+    if not item:
+        return await interaction.response.send_message("❌ Товар не найден.", ephemeral=True)
+    
+    item_id, name, description, price, item_type, role_id, is_one_time = item
+    
+    if кол_во <= 0:
+        return await interaction.response.send_message("❌ Количество должно быть больше 0.", ephemeral=True)
+    
+    success = await remove_item_from_inventory(пользователь.id, guild_id, item_id, кол_во)
+    
+    if not success:
+        return await interaction.response.send_message(f"❌ У пользователя недостаточно товара или он его не имеет.", ephemeral=True)
+    
+    embed = discord.Embed(
+        title="✅ Товар забран!",
+        description=f"Товар '{name}' забран у пользователя {пользователь.mention}",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Количество", value=f"`{кол_во}`", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+    
+# 22. CREATE_PROMO
+@bot.tree.command(name="create_promo", description="Админ: Создать промокод")
+@app_commands.checks.has_permissions(administrator=True)
+async def create_promo(interaction: discord.Interaction, код: str, сумма: int, время_окончания: Optional[str] = None):
+    """
+    Параметр `время_окончания` (необязательный) - строка формата 'YYYY-MM-DD HH:MM'
+    Пример: 2026-02-10 23:59
+    """
+    expires_at = None
+    if время_окончания:
+        try:
+            expires_at = datetime.strptime(время_окончания, "%Y-%m-%d %H:%M")
+        except ValueError:
+            return await interaction.response.send_message(
+                "❌ Укажите время в формате: **YYYY-MM-DD HH:MM**\nПример: `2026-02-10 23:59`", 
+                ephemeral=True
+            )
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        try:
+            await db.execute(
+                "INSERT INTO promo_codes (code, reward, expires_at, created_by) VALUES (?, ?, ?, ?)",
+                (код, сумма, expires_at.isoformat() if expires_at else None, interaction.user.id)
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            return await interaction.response.send_message("❌ Такой промокод уже существует.", ephemeral=True)
+    
+    expire_text = f"\n⏰ Истекает: `{время_окончания}`" if время_окончания else "\n⏰ Срок: бесконечный"
+    
+    embed = discord.Embed(
+        title="✅ Промокод создан!",
+        description=f"Промокод `{код}`",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Сумма", value=f"`{сумма}` Лоресиков", inline=True)
+    embed.add_field(name="Тип", value="🔴 Одноразовый", inline=True)
+    embed.add_field(name="Инструкция", value=f"Пользователи активируют командой: `/promo {код}`", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 23. DELETE_PROMO
+@bot.tree.command(name="delete_promo", description="Админ: Удалить промокод")
+@app_commands.checks.has_permissions(administrator=True)
+async def delete_promo(interaction: discord.Interaction, код: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT code FROM promo_codes WHERE code = ?", (код,))
+        row = await cursor.fetchone()
+        
+        if not row:
+            return await interaction.response.send_message(f"❌ Промокод `{код}` не найден.", ephemeral=True)
+        
+        await db.execute("DELETE FROM promo_codes WHERE code = ?", (код,))
+        await db.commit()
+    
+    await interaction.response.send_message(f"✅ Промокод `{код}` удалён.")
+
+# 24. LIST_PROMOS
+@bot.tree.command(name="list_promos", description="Админ: Список всех промокодов")
+@app_commands.checks.has_permissions(administrator=True)
+async def list_promos(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT code, reward, expires_at, redeemed_by, created_by FROM promo_codes ORDER BY code"
+        )
+        rows = await cursor.fetchall()
+    
+    if not rows:
+        return await interaction.response.send_message("❌ Промокодов нет.", ephemeral=True)
+    
+    embed = discord.Embed(title="🎁 Список промокодов", color=discord.Color.magenta())
+    
+    for code, reward, expires_at, redeemed_by, created_by in rows:
+        status = "🟢 Активен" if not redeemed_by else "🔴 Использован"
+        txt = f"**Сумма:** `{reward}` Лоресиков\n**Статус:** {status}"
+        
+        if expires_at:
+            try:
+                expires = datetime.fromisoformat(expires_at)
+                now = datetime.utcnow()
+                is_expired = now > expires
+                expire_status = "⏰ *истекает скоро*" if not is_expired else "❌ *истёк*"
+                txt += f"\n**Истекает:** `{expires.strftime('%Y-%m-%d %H:%M')}` {expire_status}"
+            except:
+                txt += f"\n**Истекает:** `{expires_at}`"
+        else:
+            txt += "\n**Истекает:** ∞ (никогда)"
+        
+        embed.add_field(name=f"`{code}`", value=txt, inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+# 25. PROMO 
+@bot.tree.command(name="promo", description="Активировать промокод")
+async def promo(interaction: discord.Interaction, код: str):
+    user_id = interaction.user.id
+    guild_id = interaction.guild.id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT reward, expires_at, redeemed_by FROM promo_codes WHERE code = ?", 
+            (код,)
+        )
+        row = await cursor.fetchone()
+        
+        if not row:
+            return await interaction.response.send_message("❌ Промокод не найден.", ephemeral=True)
+        
+        reward, expires_at, redeemed_by = row
+        
+        if redeemed_by:
+            return await interaction.response.send_message(
+                "❌ Этот промокод уже был использован кем-то.", 
+                ephemeral=True
+            )
+        
+        if expires_at:
+            try:
+                expires = datetime.fromisoformat(expires_at)
+                if datetime.utcnow() > expires:
+                    return await interaction.response.send_message(
+                        f"❌ Срок действия промокода истёк `{expires.strftime('%Y-%m-%d %H:%M')}`.", 
+                        ephemeral=True
+                    )
+            except:
+                pass
+        
+        await db.execute(
+            "UPDATE promo_codes SET redeemed_by = ?, redeemed_at = ? WHERE code = ?", 
+            (user_id, datetime.utcnow().isoformat(), код)
+        )
+        await db.commit()
+    
+    await update_balance(user_id, guild_id, reward)
+    
+    embed = discord.Embed(
+        title="🎉 Промокод активирован!",
+        description=f"Код `{код}` успешно использован",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Вам начислено", value=f"`{reward}` Лоресиков", inline=True)
+    embed.add_field(name="Новый баланс", value=f"`{await get_balance(user_id, guild_id)}` Лоресиков", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
 
 # --- ЗАПУСК ---
 @bot.event
