@@ -8,6 +8,7 @@ import io
 import os
 from typing import Optional
 from dotenv import load_dotenv
+from discord.app_commands import MissingPermissions, CheckFailure
 from discord.ext import commands
 from discord import app_commands
 from datetime import datetime, timedelta
@@ -1008,6 +1009,31 @@ async def promo(interaction: discord.Interaction, код: str):
     embed.add_field(name="Новый баланс", value=f"`{await get_balance(user_id, guild_id)}` Лоресиков", inline=True)
     
     await interaction.response.send_message(embed=embed)
+    
+# --- ОБРАБОТЧИК ОШИБКО ---   
+    
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    """Обработчик ошибок для слэш-команд"""
+    
+    if isinstance(error, CheckFailure):
+        embed = discord.Embed(
+            title="❌ Доступ запрещён",
+            description="Эта команда доступна только **администраторам сервера**!",
+            color=discord.Color.red()
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    elif isinstance(error, Exception):
+        embed = discord.Embed(
+            title="❌ Ошибка команды",
+            description=f"При выполнении команды произошла ошибка:\n```{str(error)[:100]}```",
+            color=discord.Color.red()
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        print(f"Ошибка команды {interaction.command.name}: {error}")
 
 # --- ЗАПУСК ---
 @bot.event
