@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from discord.app_commands import MissingPermissions, CheckFailure
 from discord.ext import commands
 from discord import app_commands
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- НАСТРОЙКА ---
 
@@ -87,11 +87,20 @@ async def init_db():
                 code TEXT PRIMARY KEY,
                 reward INTEGER NOT NULL,
                 expires_at DATETIME,
-                created_by INTEGER,
-                redeemed_by INTEGER,
-                redeemed_at DATETIME
+                created_by INTEGER
             )
         """)
+        await db.execute("""
+    CREATE TABLE IF NOT EXISTS promo_redemptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        guild_id INTEGER NOT NULL,
+        redeemed_at DATETIME,
+        UNIQUE(code, user_id, guild_id),
+        FOREIGN KEY (code) REFERENCES promo_codes(code)
+    )
+""")
         await db.commit()
     await load_events_from_db()
 
@@ -243,7 +252,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name="🛍️ Магазин", value=(
         "`/shop` — Просмотреть товары магазина\n"
         "`/inventory` — Посмотреть инвентарь\n"
-        "`/buy [id_товара]` — Купить товар"
+        "`/buy [id_товара] [кол-во (опц)]` — Купить товар"
     ), inline=False)
     
     embed.add_field(name="🎁 Промо", value="`/promo [код]` — активировать промокод и получить награду", inline=False)
@@ -667,9 +676,12 @@ async def inventory(interaction: discord.Interaction, пользователь: 
 
 # 16. BUY
 @bot.tree.command(name="buy", description="Купить товар")
-async def buy(interaction: discord.Interaction, id_товара: int):
+async def buy(interaction: discord.Interaction, id_товара: int, кол_во: int = 1):
     guild_id = interaction.guild.id
     user_id = interaction.user.id
+    
+    if кол_во < 1:
+        return await interaction.response.send_message("❌ Количество должно быть больше 0.", ephemeral=True)
     
     item = await get_shop_item(id_товара, guild_id)
     if not item:
@@ -677,20 +689,31 @@ async def buy(interaction: discord.Interaction, id_товара: int):
     
     item_id, name, description, price, item_type, role_id, is_one_time = item
     
-    if is_one_time:
-        already_bought = await is_one_time_purchased(user_id, guild_id, item_id)
-        if already_bought:
-            return await interaction.response.send_message(f"❌ Вы уже купили этот товар! Он одноразовый.", ephemeral=True)
-    
-    balance = await get_balance(user_id, guild_id)
-    if balance < price:
+    if is_one_time and кол_во > 1:
         return await interaction.response.send_message(
-            f"❌ Недостаточно средств! Нужно {price}, у вас {balance}.", 
+            "❌ Этот товар одноразовый! Можно купить максимум 1 копию.",
             ephemeral=True
         )
     
-    await update_balance(user_id, guild_id, -price)
-    await add_item_to_inventory(user_id, guild_id, item_id, 1)
+    if is_one_time:
+        already_bought = await is_one_time_purchased(user_id, guild_id, item_id)
+        if already_bought:
+            return await interaction.response.send_message(
+                f"❌ Вы уже купили этот товар! Он одноразовый.",
+                ephemeral=True
+            )
+    
+    balance = await get_balance(user_id, guild_id)
+    total_price = price * кол_во
+    
+    if balance < total_price:
+        return await interaction.response.send_message(
+            f"❌ Недостаточно средств! Нужно {total_price}, у вас {balance}.",
+            ephemeral=True
+        )
+    
+    await update_balance(user_id, guild_id, -total_price)
+    await add_item_to_inventory(user_id, guild_id, item_id, кол_во)
     
     role_given = False
     if item_type == "role" and role_id:
@@ -711,8 +734,10 @@ async def buy(interaction: discord.Interaction, id_товара: int):
         color=discord.Color.green()
     )
     embed.add_field(name="Описание", value=description, inline=False)
-    embed.add_field(name="Цена", value=f"`{price}` Лоресиков", inline=True)
-    embed.add_field(name="Новый баланс", value=f"`{balance - price}` Лоресиков", inline=True)
+    embed.add_field(name="Количество", value=f"`{кол_во}` шт.", inline=True)
+    embed.add_field(name="Цена за единицу", value=f"`{price}` Лоресиков", inline=True)
+    embed.add_field(name="Общая цена", value=f"`{total_price}` Лоресиков", inline=True)
+    embed.add_field(name="Новый баланс", value=f"`{balance - total_price}` Лоресиков", inline=True)
     if role_given:
         embed.add_field(name="👑 Роль выдана!", value=role.mention, inline=True)
     
@@ -869,10 +894,6 @@ async def take_item(interaction: discord.Interaction, пользователь: 
 @bot.tree.command(name="create_promo", description="Админ: Создать промокод")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_promo(interaction: discord.Interaction, код: str, сумма: int, время_окончания: Optional[str] = None):
-    """
-    Параметр `время_окончания` (необязательный) - строка формата 'YYYY-MM-DD HH:MM'
-    Пример: 2026-02-10 23:59
-    """
     expires_at = None
     if время_окончания:
         try:
@@ -893,7 +914,7 @@ async def create_promo(interaction: discord.Interaction, код: str, сумма
         except aiosqlite.IntegrityError:
             return await interaction.response.send_message("❌ Такой промокод уже существует.", ephemeral=True)
     
-    expire_text = f"\n⏰ Истекает: `{время_окончания}`" if время_окончания else "\n⏰ Срок: бесконечный"
+    expire_text = f"⏰ Истекает: `{время_окончания}`" if время_окончания else "⏰ Срок: ∞ (бесконечный)"
     
     embed = discord.Embed(
         title="✅ Промокод создан!",
@@ -901,8 +922,8 @@ async def create_promo(interaction: discord.Interaction, код: str, сумма
         color=discord.Color.gold()
     )
     embed.add_field(name="Сумма", value=f"`{сумма}` Лоресиков", inline=True)
-    embed.add_field(name="Тип", value="🔴 Одноразовый", inline=True)
-    embed.add_field(name="Инструкция", value=f"Пользователи активируют командой: `/promo {код}`", inline=False)
+    embed.add_field(name="Тип", value="🟢 Множественное использование", inline=True)
+    embed.add_field(name="Инструкция", value=f"Пользователи активируют командой:\n`/promo {код}`", inline=False)
     
     await interaction.response.send_message(embed=embed)
 
@@ -926,25 +947,33 @@ async def delete_promo(interaction: discord.Interaction, код: str):
 @bot.tree.command(name="list_promos", description="Админ: Список всех промокодов")
 @app_commands.checks.has_permissions(administrator=True)
 async def list_promos(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT code, reward, expires_at, redeemed_by, created_by FROM promo_codes ORDER BY code"
+            "SELECT code, reward, expires_at, created_by FROM promo_codes ORDER BY code"
         )
         rows = await cursor.fetchall()
     
     if not rows:
-        return await interaction.response.send_message("❌ Промокодов нет.", ephemeral=True)
+        return await interaction.followup.send("❌ Промокодов нет.", ephemeral=True)
     
     embed = discord.Embed(title="🎁 Список промокодов", color=discord.Color.magenta())
     
-    for code, reward, expires_at, redeemed_by, created_by in rows:
-        status = "🟢 Активен" if not redeemed_by else "🔴 Использован"
-        txt = f"**Сумма:** `{reward}` Лоресиков\n**Статус:** {status}"
+    for code, reward, expires_at, created_by in rows:
+        async with aiosqlite.connect(DB_NAME) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM promo_redemptions WHERE code = ?",
+                (code,)
+            )
+            count = (await cursor.fetchone())[0]
+        
+        txt = f"**Сумма:** `{reward}` Лоресиков\n**Использований:** `{count}`"
         
         if expires_at:
             try:
                 expires = datetime.fromisoformat(expires_at)
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 is_expired = now > expires
                 expire_status = "⏰ *истекает скоро*" if not is_expired else "❌ *истёк*"
                 txt += f"\n**Истекает:** `{expires.strftime('%Y-%m-%d %H:%M')}` {expire_status}"
@@ -955,9 +984,9 @@ async def list_promos(interaction: discord.Interaction):
         
         embed.add_field(name=f"`{code}`", value=txt, inline=False)
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-# 25. PROMO 
+# 25. PROMO
 @bot.tree.command(name="promo", description="Активировать промокод")
 async def promo(interaction: discord.Interaction, код: str):
     user_id = interaction.user.id
@@ -965,7 +994,7 @@ async def promo(interaction: discord.Interaction, код: str):
     
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT reward, expires_at, redeemed_by FROM promo_codes WHERE code = ?", 
+            "SELECT reward, expires_at FROM promo_codes WHERE code = ?",
             (код,)
         )
         row = await cursor.fetchone()
@@ -973,30 +1002,42 @@ async def promo(interaction: discord.Interaction, код: str):
         if not row:
             return await interaction.response.send_message("❌ Промокод не найден.", ephemeral=True)
         
-        reward, expires_at, redeemed_by = row
-        
-        if redeemed_by:
-            return await interaction.response.send_message(
-                "❌ Этот промокод уже был использован кем-то.", 
-                ephemeral=True
-            )
+        reward, expires_at = row
         
         if expires_at:
             try:
                 expires = datetime.fromisoformat(expires_at)
-                if datetime.utcnow() > expires:
+                if datetime.now(timezone.utc) > expires:
                     return await interaction.response.send_message(
-                        f"❌ Срок действия промокода истёк `{expires.strftime('%Y-%m-%d %H:%M')}`.", 
+                        f"❌ Срок действия промокода истёк `{expires.strftime('%Y-%m-%d %H:%M')}`.",
                         ephemeral=True
                     )
-            except:
+            except Exception:
                 pass
         
-        await db.execute(
-            "UPDATE promo_codes SET redeemed_by = ?, redeemed_at = ? WHERE code = ?", 
-            (user_id, datetime.utcnow().isoformat(), код)
+        cursor = await db.execute(
+            "SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ? AND guild_id = ?",
+            (код, user_id, guild_id)
         )
-        await db.commit()
+        already = await cursor.fetchone()
+        
+        if already:
+            return await interaction.response.send_message(
+                "❌ Вы уже активировали этот промокод!",
+                ephemeral=True
+            )
+        
+        try:
+            await db.execute(
+                "INSERT INTO promo_redemptions (code, user_id, guild_id, redeemed_at) VALUES (?, ?, ?, ?)",
+                (код, user_id, guild_id, datetime.now(timezone.utc).isoformat())
+            )
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            return await interaction.response.send_message(
+                "❌ Вы уже активировали этот промокод!",
+                ephemeral=True
+            )
     
     await update_balance(user_id, guild_id, reward)
     
@@ -1016,6 +1057,8 @@ async def promo(interaction: discord.Interaction, код: str):
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
     """Обработчик ошибок для слэш-команд"""
     
+    is_responded = interaction.response.is_done()
+    
     if isinstance(error, CheckFailure):
         embed = discord.Embed(
             title="❌ Доступ запрещён",
@@ -1023,7 +1066,10 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
             color=discord.Color.red()
         )
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if is_responded:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
     
     elif isinstance(error, Exception):
         embed = discord.Embed(
@@ -1032,7 +1078,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
             color=discord.Color.red()
         )
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if is_responded:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        
         print(f"Ошибка команды {interaction.command.name}: {error}")
 
 # --- ЗАПУСК ---
