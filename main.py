@@ -12,8 +12,11 @@ from discord.app_commands import MissingPermissions, CheckFailure
 from discord.ext import commands
 from discord import app_commands
 from datetime import datetime, timedelta, timezone
+from logger_config import setup_logger
 
 # --- НАСТРОЙКА ---
+
+logger = setup_logger()
 
 if sys.platform == "win32":
     try:
@@ -40,6 +43,7 @@ SLOTS_WEIGHTED = (["🍋"] * 10 + ["🍎"] * 8 + ["🍒"] * 5 + ["💎"] * 2 + [
 SLOT_PAYOUTS = {"🍋": 2, "🍎": 3, "🍒": 5, "💎": 10, "7️⃣": 20}
 
 async def init_db():
+    logger.info("🛠️ Начало инициализации базы данных...")
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -103,6 +107,7 @@ async def init_db():
 """)
         await db.commit()
     await load_events_from_db()
+    logger.info("✅ База данных инициализирована успешно")
 
 async def load_events_from_db():
     global active_events
@@ -112,6 +117,9 @@ async def load_events_from_db():
         for g_id, e_id, data_str in rows:
             if g_id not in active_events: active_events[g_id] = {}
             active_events[g_id][int(e_id)] = json.loads(data_str)
+    
+    total_events = sum(len(events) for events in active_events.values())        
+    logger.info(f"📅 Загружено {total_events} событий из БД")
 
 async def get_balance(user_id, guild_id):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -128,6 +136,11 @@ async def update_balance(user_id, guild_id, amount):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ? AND guild_id = ?", (int(amount), user_id, guild_id))
         await db.commit()
+        
+    if amount > 0:
+        logger.info(f"💳 [DB] Баланс изменен: Пользователь {user_id} получил {amount} Лоресиков")
+    else:
+        logger.info(f"💳 [DB] Баланс изменен: У пользователя {user_id} списано {abs(amount)} Лоресиков")
         
 async def add_item_to_inventory(user_id, guild_id, item_id, quantity=1):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -148,6 +161,7 @@ async def add_item_to_inventory(user_id, guild_id, item_id, quantity=1):
                 (user_id, guild_id, item_id, quantity)
             )
         await db.commit()
+    logger.info(f"📦 [DB] Инвентарь: Пользователю {user_id} добавлен предмет ID {item_id} ({quantity} шт.)")
 
 async def remove_item_from_inventory(user_id, guild_id, item_id, quantity=1):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -169,6 +183,7 @@ async def remove_item_from_inventory(user_id, guild_id, item_id, quantity=1):
                     (quantity, user_id, guild_id, item_id)
                 )
             await db.commit()
+            logger.info(f"📦 [DB] Инвентарь: У пользователя {user_id} изъят предмет ID {item_id} ({quantity} шт.)")
             return True
         return False
 
@@ -207,6 +222,7 @@ async def create_shop_item(guild_id, name, description, price, item_type, role_i
                 (guild_id, name, description, price, item_type, role_id, is_one_time)
             )
             await db.commit()
+            logger.info(f"🏪 [DB] Магазин: Создан товар '{name}' за {price}")
             return cursor.lastrowid
         except aiosqlite.IntegrityError:
             return None
@@ -217,6 +233,7 @@ async def delete_shop_item(item_id, guild_id):
         await db.execute("DELETE FROM inventory WHERE item_id = ? AND guild_id = ?", (item_id, guild_id))
         await db.execute("DELETE FROM one_time_purchases WHERE item_id = ? AND guild_id = ?", (item_id, guild_id))
         await db.commit()
+    logger.info(f"🏪 [DB] Магазин: Удален товар ID {item_id}")
 
 async def is_one_time_purchased(user_id, guild_id, item_id):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -239,6 +256,7 @@ async def mark_one_time_purchased(user_id, guild_id, item_id):
 # 0. HELP
 @bot.tree.command(name="help", description="Показать список всех команд")
 async def help_command(interaction: discord.Interaction):
+    logger.info(f"ℹ️ /help | Вызвал: {interaction.user} (ID: {interaction.user.id})")
     embed = discord.Embed(title="📖 Справка по командам", color=discord.Color.green())
     
     embed.add_field(name="💰 Экономика и Игры", value=(
@@ -274,7 +292,7 @@ async def help_command(interaction: discord.Interaction):
             "`/create_role_item` — Создать товар-роль\n"
             "`/delete_item [id]` — Удалить товар\n"
             "`/give_item [пользователь] [id_товара] [кол-во]` — Выдать товар\n"
-            "`/take_item [пользователь] [id_товара] [кол-во]` — Забрать товар"
+            "`/remove_item [пользователь] [id_товара] [кол-во]` — Забрать товар"
         ), inline=False)
         
         embed.add_field(name="🎁 Промокоды", value=(
@@ -289,12 +307,16 @@ async def help_command(interaction: discord.Interaction):
 @bot.tree.command(name="balance", description="Посмотреть баланс")
 async def balance(interaction: discord.Interaction, пользователь: discord.Member = None):
     target = пользователь or interaction.user
+    logger.info(f"💰 /balance | Вызвал: {interaction.user} ({interaction.user.id}) | Цель: {target} (ID: {target.id})")
+    
     bal = await get_balance(target.id, interaction.guild.id)
     await interaction.response.send_message(f"💰 Баланс {target.mention}: `{bal}` Лоресиков.")
 
 # 2. SLOTS
 @bot.tree.command(name="slots", description="Сыграть в казино")
 async def slots(interaction: discord.Interaction, сумма: int):
+    logger.info(f"🎰 /slots | Вызвал: {interaction.user} | Ставка: {сумма}")
+    
     if сумма < 10: return await interaction.response.send_message("❌ Минимум 10 Лоресиков.", ephemeral=True)
     bal = await get_balance(interaction.user.id, interaction.guild.id)
     if сумма > bal: return await interaction.response.send_message("❌ Недостаточно Лоресиков.", ephemeral=True)
@@ -309,8 +331,10 @@ async def slots(interaction: discord.Interaction, сумма: int):
         win = сумма * SLOT_PAYOUTS[res[0]]
         await update_balance(interaction.user.id, interaction.guild.id, win)
         msg = f"🎉 **ВЫИГРЫШ!** {win} Лоресиков!"
+        logger.info(f"🎰 /slots | Результат: WIN | {interaction.user} выиграл {win}")
     else:
         msg = "❌ Проигрыш."
+        logger.info(f"🎰 /slots | Результат: LOSE | {interaction.user} проиграл {сумма}")
 
     embed = discord.Embed(title="Игровой автомат", description=f"**[ {line} ]**\n\n{msg}", color=discord.Color.orange())
     
@@ -319,11 +343,13 @@ async def slots(interaction: discord.Interaction, сумма: int):
 # 3. EVENTS
 @bot.tree.command(name="events", description="Список событий")
 async def events(interaction: discord.Interaction, id_события: int = None):
+    logger.info(f"📅 /events | Вызвал: {interaction.user} ({interaction.user.id}) | ID события: {id_события if id_события else 'Все'}")
+    
     evs = active_events.get(interaction.guild.id, {})
     
     if id_события is None:
         if not evs: 
-            return await interaction.response.send_message("Не�� активных событий.", ephemeral=True)
+            return await interaction.response.send_message("Нет активных событий.", ephemeral=True)
         
         embed = discord.Embed(title="📅 Активные события", color=discord.Color.blue())
         for eid, data in evs.items():
@@ -373,6 +399,8 @@ async def events(interaction: discord.Interaction, id_события: int = None
 # 4. BET
 @bot.tree.command(name="bet", description="Сделать ставку")
 async def bet(interaction: discord.Interaction, id_события: int, выбор: str, сумма: int):
+    logger.info(f"🎲 /bet | Вызвал: {interaction.user} ({interaction.user.id}) | EventID: {id_события} | Выбор: {выбор} | Сумма: {сумма}")
+    
     ev = active_events.get(interaction.guild.id, {}).get(id_события)
     if not ev: return await interaction.response.send_message("❌ Матч не найден.", ephemeral=True)
     if ev["locked"]: return await interaction.response.send_message("❌ Ставки закрыты.", ephemeral=True)
@@ -395,6 +423,8 @@ async def bet(interaction: discord.Interaction, id_события: int, выбо
 @bot.tree.command(name="create_match", description="Админ: Создать матч")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_match(interaction: discord.Interaction, команда1: str, ростер1: str, кэф1: float, команда2: str, ростер2: str, кэф2: float):
+    logger.info(f"⚔️ /create_match | Админ: {interaction.user} ({interaction.user.id}) | {команда1} (x{кэф1}) vs {команда2} (x{кэф2})")
+    
     eid = (max(active_events.get(interaction.guild.id, {}).keys()) if active_events.get(interaction.guild.id, {}) else 0) + 1
     
     event_data = {
@@ -426,6 +456,7 @@ async def create_match(interaction: discord.Interaction, команда1: str, �
 @bot.tree.command(name="create_mvp", description="Админ: Ставка на MVP")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_mvp(interaction: discord.Interaction, название: str, данные: str):
+    logger.info(f"⭐ /create_mvp | Админ: {interaction.user} ({interaction.user.id}) | Название: {название} | Данные: {данные}")
     guild_id = interaction.guild.id
     
     eid = (max(active_events.get(guild_id, {}).keys()) if active_events.get(guild_id, {}) else 0) + 1
@@ -482,6 +513,7 @@ async def create_mvp(interaction: discord.Interaction, название: str, д
 @bot.tree.command(name="create_total", description="Админ: Создать тотал")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_total(interaction: discord.Interaction, описание: str, кэф_бол: float, кэф_мен: float):
+    logger.info(f"📊 /create_total | Админ: {interaction.user} ({interaction.user.id}) | Описание: {описание} | Больше: {кэф_бол} | Меньше: {кэф_мен}")
     eid = (max(active_events.get(interaction.guild.id, {}).keys()) if active_events.get(interaction.guild.id, {}) else 0) + 1
     
     event_data = {
@@ -507,6 +539,7 @@ async def create_total(interaction: discord.Interaction, описание: str, 
 @bot.tree.command(name="lock", description="Админ: Закрыть ставки")
 @app_commands.checks.has_permissions(administrator=True)
 async def lock(interaction: discord.Interaction, id_события: int):
+    logger.info(f"🔒 /lock | Админ: {interaction.user} ({interaction.user.id}) | ID события: {id_события}")
     if id_события in active_events.get(interaction.guild.id, {}):
         active_events[interaction.guild.id][id_события]["locked"] = True
         await interaction.response.send_message(f"🔒 Ставки на #{id_события} закрыты.")
@@ -515,6 +548,7 @@ async def lock(interaction: discord.Interaction, id_события: int):
 @bot.tree.command(name="unlock", description="Админ: Открыть ставки")
 @app_commands.checks.has_permissions(administrator=True)
 async def unlock(interaction: discord.Interaction, id_события: int):
+    logger.info(f"🔓 /unlock | Админ: {interaction.user} ({interaction.user.id}) | ID события: {id_события}")
     if id_события in active_events.get(interaction.guild.id, {}):
         active_events[interaction.guild.id][id_события]["locked"] = False
         await interaction.response.send_message(f"🔓 Ставки на #{id_события} открыты.")
@@ -523,6 +557,7 @@ async def unlock(interaction: discord.Interaction, id_события: int):
 @bot.tree.command(name="settle", description="Админ: Завершить событие")
 @app_commands.checks.has_permissions(administrator=True)
 async def settle(interaction: discord.Interaction, id_события: int, победитель: str):
+    logger.info(f"🏆 /settle | Админ: {interaction.user} ({interaction.user.id}) | ID события: {id_события} | Победитель: {победитель}")
     guild_id = interaction.guild.id
     
     if guild_id not in active_events or id_события not in active_events[guild_id]:
@@ -569,6 +604,8 @@ async def settle(interaction: discord.Interaction, id_события: int, по�
 
     del active_events[guild_id][id_события]
 
+    logger.info(f"✅ /settle завершен | Событие {id_события} | Выплачено победителям: {total_payouts}")
+
     embed = discord.Embed(
         title="🏁 СОБЫТИЕ ЗАВЕРШЕНО", 
         description=f"Результаты по событию **#{id_события}**\n**{event['title']}**",
@@ -584,6 +621,7 @@ async def settle(interaction: discord.Interaction, id_события: int, по�
 @bot.tree.command(name="give", description="Админ: Выдать Лоресиков")
 @app_commands.checks.has_permissions(administrator=True)
 async def give(interaction: discord.Interaction, пользователь: discord.Member, сумма: int):
+    logger.info(f"💸 /give | Админ: {interaction.user} ({interaction.user.id}) | Кому: {пользователь} ({пользователь.id}) | Сумма: {сумма}")
     await update_balance(пользователь.id, interaction.guild.id, сумма)
     await interaction.response.send_message(f"✅ Выдано {сумма} пользователю {пользователь.mention}")
 
@@ -591,12 +629,15 @@ async def give(interaction: discord.Interaction, пользователь: disco
 @bot.tree.command(name="remove", description="Админ: Забрать Лоресиков")
 @app_commands.checks.has_permissions(administrator=True)
 async def remove(interaction: discord.Interaction, пользователь: discord.Member, сумма: int):
+    logger.info(f"💸 /remove | Админ: {interaction.user} ({interaction.user.id}) | У кого: {пользователь} ({пользователь.id}) | Сумма: {сумма}")
     await update_balance(пользователь.id, interaction.guild.id, -сумма)
     await interaction.response.send_message(f"✅ Забрано {сумма} у пользователя {пользователь.mention}")
     
 # 13. PAY 
 @bot.tree.command(name="pay", description="Передать Лоресики другому пользователю")
 async def pay(interaction: discord.Interaction, получатель: discord.Member, колво: int):
+    logger.info(f"💳 /pay | От: {interaction.user} ({interaction.user.id}) | Кому: {получатель} ({получатель.id}) | Сумма: {колво}")
+    
     if колво <= 0:
         return await interaction.response.send_message("❌ Сумма перевода должна быть больше 0!", ephemeral=True)
     
@@ -633,6 +674,7 @@ async def pay(interaction: discord.Interaction, получатель: discord.Me
 # 14. SHOP
 @bot.tree.command(name="shop", description="Просмотреть магазин")
 async def shop(interaction: discord.Interaction):
+    logger.info(f"🏪 /shop | Вызвал: {interaction.user} ({interaction.user.id}) ")
     guild_id = interaction.guild.id
     items = await get_shop_items(guild_id)
     
@@ -654,6 +696,7 @@ async def shop(interaction: discord.Interaction):
 @bot.tree.command(name="inventory", description="Посмотреть инвентарь")
 async def inventory(interaction: discord.Interaction, пользователь: discord.Member = None):
     target = пользователь or interaction.user
+    logger.info(f"🎒 /inventory | Вызвал: {interaction.user} ({interaction.user.id}) | Чей инвентарь: {target} ({target.id})")
     guild_id = interaction.guild.id
     
     inv = await get_user_inventory(target.id, guild_id)
@@ -677,6 +720,7 @@ async def inventory(interaction: discord.Interaction, пользователь: 
 # 16. BUY
 @bot.tree.command(name="buy", description="Купить товар")
 async def buy(interaction: discord.Interaction, id_товара: int, кол_во: int = 1):
+    logger.info(f"🛒 /buy | Вызвал: {interaction.user} ({interaction.user.id}) | ID товара: {id_товара} | Кол-во: {кол_во}")
     guild_id = interaction.guild.id
     user_id = interaction.user.id
     
@@ -747,6 +791,7 @@ async def buy(interaction: discord.Interaction, id_товара: int, кол_в�
 @bot.tree.command(name="create_item", description="Админ: Создать товар")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_item(interaction: discord.Interaction, название: str, описание: str, цена: int, одноразовый: bool = False):
+    logger.info(f"🔨 /create_item | Админ: {interaction.user} ({interaction.user.id}) | Товар: {название} | Цена: {цена}")
     guild_id = interaction.guild.id
     
     if цена <= 0:
@@ -776,6 +821,7 @@ async def create_item(interaction: discord.Interaction, название: str, �
 @bot.tree.command(name="create_role_item", description="Админ: Создать товар-роль")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_role_item(interaction: discord.Interaction, название: str, описание: str, цена: int, роль: discord.Role, одноразовый: bool = False):
+    logger.info(f"👑 /create_role_item | Админ: {interaction.user} ({interaction.user.id}) | Товар: {название} | Роль: {роль.name}")
     guild_id = interaction.guild.id
     
     if цена <= 0:
@@ -806,6 +852,7 @@ async def create_role_item(interaction: discord.Interaction, название: s
 @bot.tree.command(name="delete_item", description="Админ: Удалить товар")
 @app_commands.checks.has_permissions(administrator=True)
 async def delete_item(interaction: discord.Interaction, id_товара: int):
+    logger.info(f"🗑️ /delete_item | Админ: {interaction.user} ({interaction.user.id}) | ID товара: {id_товара}")
     guild_id = interaction.guild.id
     
     item = await get_shop_item(id_товара, guild_id)
@@ -828,6 +875,7 @@ async def delete_item(interaction: discord.Interaction, id_товара: int):
 @bot.tree.command(name="give_item", description="Админ: Выдать товар пользователю")
 @app_commands.checks.has_permissions(administrator=True)
 async def give_item(interaction: discord.Interaction, пользователь: discord.Member, id_товара: int, кол_во: int = 1):
+    logger.info(f"📦 /give_item | Админ: {interaction.user} ({interaction.user.id}) | Кому: {пользователь} ({пользователь.id}) | ID товара: {id_товара} | Кол-во: {кол_во}")
     guild_id = interaction.guild.id
     
     item = await get_shop_item(id_товара, guild_id)
@@ -861,10 +909,11 @@ async def give_item(interaction: discord.Interaction, пользователь: 
     
     await interaction.response.send_message(embed=embed)
 
-# 21. TAKE_ITEM
-@bot.tree.command(name="take_item", description="Админ: Забрать товар у пользователя")
+# 21. REMOVE_ITEM
+@bot.tree.command(name="remove_item", description="Админ: Забрать товар у пользователя")
 @app_commands.checks.has_permissions(administrator=True)
-async def take_item(interaction: discord.Interaction, пользователь: discord.Member, id_товара: int, кол_во: int = 1):
+async def remove_item(interaction: discord.Interaction, пользователь: discord.Member, id_товара: int, кол_во: int = 1):
+    logger.info(f"🗑️ /remove_item | Админ: {interaction.user} ({interaction.user.id}) | У кого: {пользователь} ({пользователь.id}) | ID товара: {id_товара} | Кол-во: {кол_во}")
     guild_id = interaction.guild.id
     
     item = await get_shop_item(id_товара, guild_id)
@@ -894,13 +943,14 @@ async def take_item(interaction: discord.Interaction, пользователь: 
 @bot.tree.command(name="create_promo", description="Админ: Создать промокод")
 @app_commands.checks.has_permissions(administrator=True)
 async def create_promo(interaction: discord.Interaction, код: str, сумма: int, время_окончания: Optional[str] = None):
+    logger.info(f"🎟️ /create_promo | Админ: {interaction.user} ({interaction.user.id}) | Код: {код} | Сумма: {сумма}")
     expires_at = None
     if время_окончания:
         try:
             expires_at = datetime.strptime(время_окончания, "%Y-%m-%d %H:%M")
         except ValueError:
             return await interaction.response.send_message(
-                "❌ Укажите время в формате: **YYYY-MM-DD HH:MM**\nПример: `2026-02-10 23:59`", 
+                "❌ Укажите время в формате: **YYYY-MM-DD HH:MM**\nПример: `2026-04-26 23:59`", 
                 ephemeral=True
             )
 
@@ -931,6 +981,7 @@ async def create_promo(interaction: discord.Interaction, код: str, сумма
 @bot.tree.command(name="delete_promo", description="Админ: Удалить промокод")
 @app_commands.checks.has_permissions(administrator=True)
 async def delete_promo(interaction: discord.Interaction, код: str):
+    logger.info(f"🗑️ /delete_promo | Админ: {interaction.user} ({interaction.user.id}) | Код: {код}")
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute("SELECT code FROM promo_codes WHERE code = ?", (код,))
         row = await cursor.fetchone()
@@ -947,6 +998,7 @@ async def delete_promo(interaction: discord.Interaction, код: str):
 @bot.tree.command(name="list_promos", description="Админ: Список всех промокодов")
 @app_commands.checks.has_permissions(administrator=True)
 async def list_promos(interaction: discord.Interaction):
+    logger.info(f"📋 /list_promos | Админ: {interaction.user} ({interaction.user.id})")
     await interaction.response.defer()
     
     async with aiosqlite.connect(DB_NAME) as db:
@@ -989,6 +1041,7 @@ async def list_promos(interaction: discord.Interaction):
 # 25. PROMO
 @bot.tree.command(name="promo", description="Активировать промокод")
 async def promo(interaction: discord.Interaction, код: str):
+    logger.info(f"🎫 /promo | Вызвал: {interaction.user} ({interaction.user.id}) | Код: {код}")
     user_id = interaction.user.id
     guild_id = interaction.guild.id
     
@@ -1043,7 +1096,6 @@ async def promo(interaction: discord.Interaction, код: str):
     
     embed = discord.Embed(
         title="🎉 Промокод активирован!",
-        description=f"Код `{код}` успешно использован",
         color=discord.Color.green()
     )
     embed.add_field(name="Вам начислено", value=f"`{reward}` Лоресиков", inline=True)
@@ -1055,7 +1107,7 @@ async def promo(interaction: discord.Interaction, код: str):
     
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
-    """Обработчик ошибок для слэш-команд"""
+    logger.error(f"❌ ERROR | Команда: {interaction.command.name if interaction.command else 'Unknown'} | Юзер: {interaction.user} ({interaction.user.id}) | Ошибка: {error}")
     
     is_responded = interaction.response.is_done()
     
@@ -1089,7 +1141,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 @bot.event
 async def on_ready():
     await init_db()
-    print(f"Logged in as {bot.user}")
+    logger.info(f"✅ БОТ ЗАПУЩЕН | Учётная запись: {bot.user} (ID: {bot.user.id})")
+    logger.info(f"🌐 Бот подключён к {len(bot.guilds)} серверам")
     
 load_dotenv()
 bot.run(os.getenv("SECRET_KEY"))

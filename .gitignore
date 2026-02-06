@@ -1,2 +1,4 @@
 /.env
 /economy.db
+/logs
+/__pycache__
