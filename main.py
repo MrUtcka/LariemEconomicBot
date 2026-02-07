@@ -91,20 +91,27 @@ async def init_db():
                 code TEXT PRIMARY KEY,
                 reward INTEGER NOT NULL,
                 expires_at DATETIME,
-                created_by INTEGER
+                created_by INTEGER,
+                max_uses INTEGER DEFAULT NULL
             )
         """)
+
+        try:
+            await db.execute("ALTER TABLE promo_codes ADD COLUMN max_uses INTEGER DEFAULT NULL")
+        except aiosqlite.OperationalError:
+            pass
+
         await db.execute("""
-    CREATE TABLE IF NOT EXISTS promo_redemptions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code TEXT NOT NULL,
-        user_id INTEGER NOT NULL,
-        guild_id INTEGER NOT NULL,
-        redeemed_at DATETIME,
-        UNIQUE(code, user_id, guild_id),
-        FOREIGN KEY (code) REFERENCES promo_codes(code)
-    )
-""")
+            CREATE TABLE IF NOT EXISTS promo_redemptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                redeemed_at DATETIME,
+                UNIQUE(code, user_id, guild_id),
+                FOREIGN KEY (code) REFERENCES promo_codes(code)
+            )
+        """)
         await db.commit()
     await load_events_from_db()
     logger.info("✅ База данных инициализирована успешно")
@@ -261,6 +268,7 @@ async def help_command(interaction: discord.Interaction):
     
     embed.add_field(name="💰 Экономика и Игры", value=(
         "`/balance` — Проверить счет\n"
+        "`/top` — Топ богачей сервера\n"
         "`/slots [сумма]` — Играть в казино\n"
         "`/events` — Список активных матчей\n"
         "`/bet [id_события] [выбор] [сумма]` — Сделать ставку\n"
@@ -296,7 +304,7 @@ async def help_command(interaction: discord.Interaction):
         ), inline=False)
         
         embed.add_field(name="🎁 Промокоды", value=(
-            "`/create_promo [код] [сумма] [дата_время (опц)]` — создать промокод\n"
+            "`/create_promo` — создать промокод\n"
             "`/delete_promo [код]` — удалить промокод\n"
             "`/list_promos` — посмотреть все промокоды"
         ), inline=False)
@@ -942,8 +950,8 @@ async def remove_item(interaction: discord.Interaction, пользователь
 # 22. CREATE_PROMO
 @bot.tree.command(name="create_promo", description="Админ: Создать промокод")
 @app_commands.checks.has_permissions(administrator=True)
-async def create_promo(interaction: discord.Interaction, код: str, сумма: int, время_окончания: Optional[str] = None):
-    logger.info(f"🎟️ /create_promo | Админ: {interaction.user} ({interaction.user.id}) | Код: {код} | Сумма: {сумма}")
+async def create_promo(interaction: discord.Interaction, код: str, сумма: int, время_окончания: Optional[str] = None, количество_использований: Optional[int] = None):
+    logger.info(f"🎟️ /create_promo | Админ: {interaction.user} ({interaction.user.id}) | Код: {код} | Сумма: {сумма} | Лимит: {количество_использований}")
     expires_at = None
     if время_окончания:
         try:
@@ -953,18 +961,19 @@ async def create_promo(interaction: discord.Interaction, код: str, сумма
                 "❌ Укажите время в формате: **YYYY-MM-DD HH:MM**\nПример: `2026-04-26 23:59`", 
                 ephemeral=True
             )
+            
+    if количество_использований is not None and количество_использований < 1:
+        return await interaction.response.send_message("❌ Количество использований должно быть больше 0.", ephemeral=True)
 
     async with aiosqlite.connect(DB_NAME) as db:
         try:
             await db.execute(
-                "INSERT INTO promo_codes (code, reward, expires_at, created_by) VALUES (?, ?, ?, ?)",
-                (код, сумма, expires_at.isoformat() if expires_at else None, interaction.user.id)
+                "INSERT INTO promo_codes (code, reward, expires_at, created_by, max_uses) VALUES (?, ?, ?, ?, ?)",
+                (код, сумма, expires_at.isoformat() if expires_at else None, interaction.user.id, количество_использований)
             )
             await db.commit()
         except aiosqlite.IntegrityError:
             return await interaction.response.send_message("❌ Такой промокод уже существует.", ephemeral=True)
-    
-    expire_text = f"⏰ Истекает: `{время_окончания}`" if время_окончания else "⏰ Срок: ∞ (бесконечный)"
     
     embed = discord.Embed(
         title="✅ Промокод создан!",
@@ -972,7 +981,13 @@ async def create_promo(interaction: discord.Interaction, код: str, сумма
         color=discord.Color.gold()
     )
     embed.add_field(name="Сумма", value=f"`{сумма}` Лоресиков", inline=True)
-    embed.add_field(name="Тип", value="🟢 Множественное использование", inline=True)
+    
+    limit_text = f"{количество_использований} раз" if количество_использований else "∞ (безлимитно)"
+    embed.add_field(name="Лимит использований", value=limit_text, inline=True)
+    
+    if время_окончания:
+        embed.add_field(name="Истекает", value=f"`{время_окончания}`", inline=True)
+        
     embed.add_field(name="Инструкция", value=f"Пользователи активируют командой:\n`/promo {код}`", inline=False)
     
     await interaction.response.send_message(embed=embed)
@@ -1003,7 +1018,7 @@ async def list_promos(interaction: discord.Interaction):
     
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT code, reward, expires_at, created_by FROM promo_codes ORDER BY code"
+            "SELECT code, reward, expires_at, created_by, max_uses FROM promo_codes ORDER BY code"
         )
         rows = await cursor.fetchall()
     
@@ -1012,7 +1027,7 @@ async def list_promos(interaction: discord.Interaction):
     
     embed = discord.Embed(title="🎁 Список промокодов", color=discord.Color.magenta())
     
-    for code, reward, expires_at, created_by in rows:
+    for code, reward, expires_at, created_by, max_uses in rows:
         async with aiosqlite.connect(DB_NAME) as db:
             cursor = await db.execute(
                 "SELECT COUNT(*) FROM promo_redemptions WHERE code = ?",
@@ -1020,7 +1035,8 @@ async def list_promos(interaction: discord.Interaction):
             )
             count = (await cursor.fetchone())[0]
         
-        txt = f"**Сумма:** `{reward}` Лоресиков\n**Использований:** `{count}`"
+        limit_str = f"/{max_uses}" if max_uses else "/∞"
+        txt = f"**Сумма:** `{reward}` Лоресиков\n**Использовано:** `{count}{limit_str}`"
         
         if expires_at:
             try:
@@ -1033,6 +1049,9 @@ async def list_promos(interaction: discord.Interaction):
                 txt += f"\n**Истекает:** `{expires_at}`"
         else:
             txt += "\n**Истекает:** ∞ (никогда)"
+            
+        if max_uses and count >= max_uses:
+            txt += "\n⛔ **Лимит исчерпан**"
         
         embed.add_field(name=f"`{code}`", value=txt, inline=False)
     
@@ -1047,7 +1066,7 @@ async def promo(interaction: discord.Interaction, код: str):
     
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT reward, expires_at FROM promo_codes WHERE code = ?",
+            "SELECT reward, expires_at, max_uses FROM promo_codes WHERE code = ?",
             (код,)
         )
         row = await cursor.fetchone()
@@ -1055,7 +1074,7 @@ async def promo(interaction: discord.Interaction, код: str):
         if not row:
             return await interaction.response.send_message("❌ Промокод не найден.", ephemeral=True)
         
-        reward, expires_at = row
+        reward, expires_at, max_uses = row
         
         if expires_at:
             try:
@@ -1067,6 +1086,16 @@ async def promo(interaction: discord.Interaction, код: str):
                     )
             except Exception:
                 pass
+        
+        if max_uses is not None:
+            cursor = await db.execute("SELECT COUNT(*) FROM promo_redemptions WHERE code = ?", (код,))
+            current_uses = (await cursor.fetchone())[0]
+            
+            if current_uses >= max_uses:
+                return await interaction.response.send_message(
+                    "❌ Этот промокод достиг лимита использований.",
+                    ephemeral=True
+                )
         
         cursor = await db.execute(
             "SELECT 1 FROM promo_redemptions WHERE code = ? AND user_id = ? AND guild_id = ?",
@@ -1100,6 +1129,39 @@ async def promo(interaction: discord.Interaction, код: str):
     )
     embed.add_field(name="Вам начислено", value=f"`{reward}` Лоресиков", inline=True)
     embed.add_field(name="Новый баланс", value=f"`{await get_balance(user_id, guild_id)}` Лоресиков", inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+    
+# 26 TOP
+@bot.tree.command(name="top", description="Топ богачей сервера")
+async def top(interaction: discord.Interaction):
+    logger.info(f"🏆 /top | Вызвал: {interaction.user} ({interaction.user.id})")
+    guild_id = interaction.guild.id
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT user_id, balance FROM users WHERE guild_id = ? ORDER BY balance DESC LIMIT 10",
+            (guild_id,)
+        )
+        rows = await cursor.fetchall()
+        
+    if not rows:
+        return await interaction.response.send_message("❌ База данных пуста.", ephemeral=True)
+    
+    embed = discord.Embed(title="🏆 Топ богачей сервера", color=discord.Color.gold())
+    
+    description_lines = []
+    for index, (user_id, balance) in enumerate(rows, 1):
+        member = interaction.guild.get_member(user_id)
+        if member:
+            name = member.display_name
+        else:
+            name = f"Участник <{user_id}>"
+            
+        medal = "🥇" if index == 1 else "🥈" if index == 2 else "🥉" if index == 3 else f"{index}."
+        description_lines.append(f"**{medal}** {name} — `{balance}` Лоресиков")
+        
+    embed.description = "\n".join(description_lines)
     
     await interaction.response.send_message(embed=embed)
     
