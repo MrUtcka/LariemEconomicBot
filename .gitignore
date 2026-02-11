@@ -1,4 +1,6 @@
 /.env
 /economy.db
 /logs
+/cogs/__pycache__
+/utils/__pycache__
 /__pycache__
