@@ -39,8 +39,57 @@ bot = MyBot()
 DB_NAME = "economy.db"
 active_events = {}
 
-SLOTS_WEIGHTED = (["🍋"] * 10 + ["🍎"] * 8 + ["🍒"] * 5 + ["💎"] * 2 + ["7️⃣"] * 1)
-SLOT_PAYOUTS = {"🍋": 2, "🍎": 3, "🍒": 5, "💎": 10, "7️⃣": 20}
+ROULETTE_COLORS = {
+    0: "🟢",
+    **{n: "🔴" for n in [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]},
+    **{n: "⚫" for n in [2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35]}
+}
+
+SYM_WILD = "👑"
+SYM_SCATTER = "⭐"
+SYM_HIGH = ["💎", "7️⃣"]
+SYM_MID = ["🔔", "🍉", "🍇"]
+SYM_LOW = ["🍋", "🍒", "🍎"]
+SYM_EMPTY = "⬛" 
+
+user_retention_data = {} 
+
+PAYTABLE = {
+    "👑": [0, 0, 5, 20, 100],
+    "⭐": [0, 0, 10, 50, 200],
+    "💎": [0, 0, 4, 15, 50],
+    "7️⃣": [0, 0, 3, 10, 40],
+    "🔔": [0, 0, 3, 8, 30],
+    "🍉": [0, 0, 2, 5, 20],
+    "🍇": [0, 0, 1, 4, 15],
+    "🍋": [0, 0, 1, 2.5, 10],
+    "🍒": [0, 0, 1, 2, 8],
+    "🍎": [0, 0, 1, 1.5, 5],
+}
+
+PAYLINES = [
+    [1, 1, 1, 1, 1], [0, 0, 0, 0, 0], [2, 2, 2, 2, 2], 
+    [0, 1, 2, 1, 0], [2, 1, 0, 1, 2], 
+    [0, 0, 1, 2, 2], [2, 2, 1, 0, 0], 
+]
+
+def get_reels():
+    reels = []
+    for _ in range(5):
+        strip = [SYM_WILD]*2 + [SYM_SCATTER]*1 + SYM_HIGH*3 + SYM_MID*6 + SYM_LOW*10
+        random.shuffle(strip)
+        reels.append(strip)
+    return reels
+
+REEL_STRIPS = get_reels()
+
+def force_win_grid():
+    grid = [[random.choice(SYM_LOW + SYM_MID) for _ in range(5)] for _ in range(3)]
+    line = random.choice(PAYLINES)
+    win_sym = random.choice(SYM_LOW + SYM_MID)
+    for i in range(random.randint(3, 4)):
+        grid[line[i]][i] = win_sym
+    return grid
 
 async def init_db():
     logger.info("🛠️ Начало инициализации базы данных...")
@@ -321,32 +370,110 @@ async def balance(interaction: discord.Interaction, пользователь: di
     await interaction.response.send_message(f"💰 Баланс {target.mention}: `{bal}` Лоресиков.")
 
 # 2. SLOTS
-@bot.tree.command(name="slots", description="Сыграть в казино")
-async def slots(interaction: discord.Interaction, сумма: int):
-    logger.info(f"🎰 /slots | Вызвал: {interaction.user} | Ставка: {сумма}")
+@bot.tree.command(name="slots", description="Слот-машина 3x5")
+async def slots(interaction: discord.Interaction, ставка: int):
+    logger.info(f"🎰 /slots | Вызвал: {interaction.user} | Ставка: {ставка}")
+    user_id = interaction.user.id
+    guild_id = interaction.guild.id
     
-    if сумма < 10: return await interaction.response.send_message("❌ Минимум 10 Лоресиков.", ephemeral=True)
-    bal = await get_balance(interaction.user.id, interaction.guild.id)
-    if сумма > bal: return await interaction.response.send_message("❌ Недостаточно Лоресиков.", ephemeral=True)
+    if ставка < 10:
+        return await interaction.response.send_message("❌ Минимальная ставка — 10.", ephemeral=True)
+    
+    bal = await get_balance(user_id, guild_id)
+    if ставка > bal:
+        return await interaction.response.send_message(f"❌ Недостаточно средств ({bal})", ephemeral=True)
 
-    await update_balance(interaction.user.id, interaction.guild.id, -сумма)
-    await interaction.response.send_message("🎰 **Крутим...**")
-    await asyncio.sleep(1)
-
-    res = [random.choice(SLOTS_WEIGHTED) for _ in range(3)]
-    line = " | ".join(res)
-    if res[0] == res[1] == res[2]:
-        win = сумма * SLOT_PAYOUTS[res[0]]
-        await update_balance(interaction.user.id, interaction.guild.id, win)
-        msg = f"🎉 **ВЫИГРЫШ!** {win} Лоресиков!"
-        logger.info(f"🎰 /slots | Результат: WIN | {interaction.user} выиграл {win}")
+    await update_balance(user_id, guild_id, -ставка)
+    
+    if user_id not in user_retention_data:
+        user_retention_data[user_id] = 0
+    
+    loss_streak = user_retention_data[user_id]
+    pity_chance = min(0.70, loss_streak * 0.07)
+    
+    is_pity_triggered = False
+    if loss_streak >= 2 and random.random() < pity_chance:
+        grid = force_win_grid()
+        is_pity_triggered = True
     else:
-        msg = "❌ Проигрыш."
-        logger.info(f"🎰 /slots | Результат: LOSE | {interaction.user} проиграл {сумма}")
+        grid = [[None for _ in range(5)] for _ in range(3)]
+        for c in range(5):
+            stop = random.randint(0, len(REEL_STRIPS[c])-1)
+            for r in range(3):
+                grid[r][c] = REEL_STRIPS[c][(stop + r) % len(REEL_STRIPS[c])]
 
-    embed = discord.Embed(title="Игровой автомат", description=f"**[ {line} ]**\n\n{msg}", color=discord.Color.orange())
-    
-    await interaction.edit_original_response(content=None, embed=embed)
+    total_win = 0
+    win_coords = set()
+    details = []
+
+    for idx, line in enumerate(PAYLINES):
+        match_sym = grid[line[0]][0]
+        count = 1
+        temp_coords = [(line[0], 0)]
+        
+        for c in range(1, 5):
+            char = grid[line[c]][c]
+            if char == match_sym or char == SYM_WILD or match_sym == SYM_WILD:
+                count += 1
+                temp_coords.append((line[c], c))
+                if match_sym == SYM_WILD and char != SYM_WILD:
+                    match_sym = char
+            else:
+                break
+        
+        if count >= 3:
+            pay_sym = SYM_WILD if match_sym == SYM_WILD else match_sym
+            mult = PAYTABLE[pay_sym][count-1]
+            if mult > 0:
+                win_amount = int(ставка * mult)
+                total_win += win_amount
+                details.append(f"Линия {idx+1}: {pay_sym} x{count}")
+                for coord in temp_coords: win_coords.add(coord)
+
+    if total_win > 0:
+        await update_balance(user_id, guild_id, total_win)
+        user_retention_data[user_id] = 0 
+        color = discord.Color.green()
+        title = "🎰 ВЫИГРЫШ!"
+        result_text = f"💰 **+{total_win}** Лоресиков"
+        logger.info(f"🎰 /slots | Результат: WIN | {interaction.user} выиграл {total_win}")
+    else:
+        user_retention_data[user_id] += 1 
+        color = discord.Color.red()
+        title = "🎰 КАЗИНО"
+        result_text = "Ничего не выпало. Попробуй еще раз!"
+        logger.info(f"🎰 /slots | Результат: LOSE | {interaction.user} проиграл {ставка}")
+
+    board = ""
+    for r in range(3):
+        row_icons = []
+        for c in range(5):
+            row_icons.append(grid[r][c])
+        board += " | ".join(row_icons) + "\n"
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Спины", value=f"```\n{board}\n```", inline=False)
+
+    if total_win > 0:
+        line_map = ""
+        for r in range(3):
+            row_map = []
+            for c in range(5):
+                if (r, c) in win_coords:
+                    row_map.append(grid[r][c]) 
+                else:
+                    row_map.append(SYM_EMPTY)
+            line_map += " ".join(row_map) + "\n"
+        
+        embed.add_field(name="🏆 Выигрышная схема", value=f"```\n{line_map}\n```", inline=False)
+        
+        if details:
+            embed.add_field(name="Инфо", value="\n".join(details[:3]), inline=True)
+
+    embed.add_field(name="Итог", value=result_text, inline=False)
+    embed.set_footer(text=f"Баланс: {await get_balance(user_id, guild_id)}")
+
+    await interaction.response.send_message(embed=embed)
 
 # 3. EVENTS
 @bot.tree.command(name="events", description="Список событий")
@@ -1132,7 +1259,7 @@ async def promo(interaction: discord.Interaction, код: str):
     
     await interaction.response.send_message(embed=embed)
     
-# 26 TOP
+# 26. TOP
 @bot.tree.command(name="top", description="Топ богачей сервера")
 async def top(interaction: discord.Interaction):
     logger.info(f"🏆 /top | Вызвал: {interaction.user} ({interaction.user.id})")
@@ -1164,6 +1291,92 @@ async def top(interaction: discord.Interaction):
     embed.description = "\n".join(description_lines)
     
     await interaction.response.send_message(embed=embed)
+    
+# 27. ROULETTE
+@bot.tree.command(name="roulette", description="Европейская рулетка")
+@app_commands.describe(
+    ставка="Сумма Лоресиков",
+    тип_ставки="red, black, zero, even, odd, или (0-36)"
+)
+async def roulette(interaction: discord.Interaction, ставка: int, тип_ставки: str):
+    logger.info(f"🎰 /roulette | Вызвал: {interaction.user} | Ставка: {ставка}")
+    user_id = interaction.user.id
+    guild_id = interaction.guild.id
+    choice = тип_ставки.lower().strip()
+
+    if ставка < 10:
+        return await interaction.response.send_message("❌ Минимальная ставка — 10.", ephemeral=True)
+    
+    bal = await get_balance(user_id, guild_id)
+    if ставка > bal:
+        return await interaction.response.send_message(f"❌ Недостаточно средств ({bal})", ephemeral=True)
+
+    is_numeric = choice.isdigit() and 0 <= int(choice) <= 36
+    if choice in ["zero", "0"]: 
+        is_numeric = True
+        choice = "0"
+        
+    valid_choices = ["red", "black", "even", "odd"]
+    if not is_numeric and choice not in valid_choices:
+        return await interaction.response.send_message("❌ Ошибка! Используй: `red`, `black`, `zero`, `even`, `odd` или число `1-36`.", ephemeral=True)
+
+    await update_balance(user_id, guild_id, -ставка)
+    
+    await interaction.response.send_message("⚪ Шарик запущен... Колесо вращается...")
+
+    if user_id not in user_retention_data: user_retention_data[user_id] = 0
+    
+    result = random.randint(0, 36)
+
+    win_multiplier = 0
+    res_color = ROULETTE_COLORS[result]
+    
+    if is_numeric and int(choice) == result:
+        win_multiplier = 36 
+    elif choice == "red" and res_color == "🔴":
+        win_multiplier = 2
+    elif choice == "black" and res_color == "⚫":
+        win_multiplier = 2
+    elif choice == "even" and result % 2 == 0:
+        win_multiplier = 2
+    elif choice == "odd" and result % 2 != 0:
+        win_multiplier = 2
+
+    if win_multiplier > 0:
+        total_payout = ставка * win_multiplier
+        await update_balance(user_id, guild_id, total_payout)
+        user_retention_data[user_id] = 0
+        color = discord.Color.green()
+        title = "🎉 ПОБЕДА В РУЛЕТКЕ!"
+        summary = f"💰 **+{total_payout}** Лоресиков"
+        logger.info(f"🎰 /roulette | Результат: WIN | {interaction.user} выиграл {total_payout}")
+    else:
+        user_retention_data[user_id] += 1
+        color = discord.Color.red() 
+        title = "💀 СТАВКА НЕ СЫГРАЛА"
+        summary = "Ничего не выпало. Попробуй еще раз!"
+        logger.info(f"🎰 /roulette | Результат: LOSE | {interaction.user} проиграл {ставка}")
+
+    def get_lane(res):
+        items = []
+        for i in range(res - 2, res + 3):
+            n = i % 37
+            c = ROULETTE_COLORS[n]
+            if n == res: items.append(f"**[{c}{n}]**")
+            else: items.append(f"{c}{n}")
+        return " — ".join(items)
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Вращение", value=f"```\n{get_lane(result)}\n```", inline=False)
+    
+    bet_display = f"ЗЕРО" if choice == "0" else choice.upper()
+    embed.add_field(name="Ваша ставка", value=f"`{bet_display}`", inline=True)
+    embed.add_field(name="Выпало", value=f"{res_color} **{result}**", inline=True)
+    
+    embed.add_field(name="Итог", value=f"{summary}", inline=False)
+    embed.set_footer(text=f"Баланс: {await get_balance(user_id, guild_id)}")
+
+    await interaction.edit_original_response(content=None, embed=embed)
     
 # --- ОБРАБОТЧИК ОШИБКО ---   
     
