@@ -9,7 +9,6 @@ logger = setup_logger()
 
 user_retention_data = {}
 
-# Константы для слотов
 SYM_WILD = "👑"
 SYM_SCATTER = "⭐"
 SYM_HIGH = ["💎", "7️⃣"]
@@ -42,25 +41,22 @@ ROULETTE_COLORS = {
     **{n: "⚫" for n in [2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35]}
 }
 
-# Константы для бомб
 CLOSED_CELL = "🔲"
 REVEALED_BOMB = "☠️"
 REVEALED_CRYSTAL = "✨"
 
-# Шаг коэффициента зависит от кол-ва бомб
 BOMB_COEFFICIENT_STEPS = {
     1: 0.05,
     2: 0.10,
     3: 0.15,
-    4: 0.20,
-    5: 0.25,
-    6: 0.30,
-    7: 0.35,
-    8: 0.40,
+    4: 0.30,
+    5: 0.45,
+    6: 0.60,
+    7: 1.00,
+    8: 2.50,
 }
 
 def get_bomb_coefficient(bombs_count, crystals_found):
-    """Получить коэффициент в зависимости от кол-ва бомб и открытых кристаллов"""
     if bombs_count not in BOMB_COEFFICIENT_STEPS:
         bombs_count = 8
     
@@ -113,15 +109,24 @@ class BombButton(ui.Button):
         if is_bomb:
             await self.game_view.end_game_lose(interaction)
         else:
-            # Проверяем, все ли кристаллы открыты
+            win_streak = user_retention_data.get(interaction.user.id, 0)
+            loss_chance = min(0.50, (win_streak - 2) * 0.10) if win_streak > 2 else 0
+            
+            if random.random() < loss_chance:
+                bomb_cells = [(y, x) for y in range(3) for x in range(3) 
+                             if not game_data['revealed'][y][x] and game_data['grid'][y][x]]
+                if bomb_cells:
+                    y, x = random.choice(bomb_cells)
+                    game_data['revealed'][y][x] = True
+                    await self.game_view.end_game_lose(interaction, forced_loss=True)
+                    return
+            
             crystals_found = sum(1 for y in range(3) for x in range(3) 
                                if game_data['revealed'][y][x] and not game_data['grid'][y][x])
             
             if crystals_found == game_data['crystals_total']:
-                # Все кристаллы найдены - автоматический финиш
                 await self.game_view.finish_game(interaction, auto_win=True)
             else:
-                # Обновляем доску
                 await self.game_view.update_game_board(interaction)
 
 class FinishButton(ui.Button):
@@ -145,7 +150,6 @@ class BombGameView(ui.View):
         self.game_data = game_data
 
     def _render_bomb_board(self):
-        """Отрисовывает поле бомб 3x3"""
         revealed = self.game_data['revealed']
         grid = self.game_data['grid']
         
@@ -164,7 +168,6 @@ class BombGameView(ui.View):
         return board
 
     async def update_game_board(self, interaction: discord.Interaction):
-        """Обновляет доску игры"""
         board = self._render_bomb_board()
         crystals_found = sum(1 for y in range(3) for x in range(3) 
                            if self.game_data['revealed'][y][x] and not self.game_data['grid'][y][x])
@@ -182,8 +185,7 @@ class BombGameView(ui.View):
 
         await interaction.message.edit(embed=embed, view=self)
 
-    async def end_game_lose(self, interaction: discord.Interaction):
-        """Завершение игры - поражение"""
+    async def end_game_lose(self, interaction: discord.Interaction, forced_loss: bool = False):
         for y in range(3):
             for x in range(3):
                 self.game_data['revealed'][y][x] = True
@@ -191,56 +193,28 @@ class BombGameView(ui.View):
         board = self._render_bomb_board()
         user_retention_data[self.game_data['user_id']] = user_retention_data.get(self.game_data['user_id'], 0) + 1
 
+        loss_message = "💔 Ставка потеряна"
+
         embed = discord.Embed(
             title="☠️ ИГРА ОКОНЧЕНА - БОМБА!",
             color=discord.Color.red()
         )
         embed.add_field(name="Поле:", value=board, inline=False)
-        embed.add_field(name="Результат:", value="💔 Ставка потеряна", inline=False)
+        embed.add_field(name="Результат:", value=loss_message, inline=False)
         new_bal = await get_balance(interaction.user.id, self.game_data['guild_id'])
         embed.set_footer(text=f"Ваш баланс: {new_bal} Лоресиков")
 
         await interaction.message.edit(embed=embed, view=None)
 
-        logger.info(f"💣 /bombs | {interaction.user} попал на бомбу и проиграл {self.game_data['bet']}")
+        if forced_loss:
+            logger.info(f"💣 /bombs | {interaction.user} получил принудительное поражение и проиграл {self.game_data['bet']}")
+        else:
+            logger.info(f"💣 /bombs | {interaction.user} попал на бомбу и проиграл {self.game_data['bet']}")
 
     async def finish_game(self, interaction: discord.Interaction, auto_win: bool = False):
-        """Завершение игры - финиш с текущим коэффициентом"""
         crystals_found = sum(1 for y in range(3) for x in range(3) 
                            if self.game_data['revealed'][y][x] and not self.game_data['grid'][y][x])
         
-        # Если не все кристаллы найдены и это не автоматический финиш
-        if crystals_found < self.game_data['crystals_total'] and not auto_win:
-            # Проверяем систему 50%
-            if not self.game_data['will_win']:
-                # Игрок должен проиграть - находим случайную бомбу и "взрываем" её
-                bomb_cells = [(y, x) for y in range(3) for x in range(3) 
-                             if not self.game_data['revealed'][y][x] and self.game_data['grid'][y][x]]
-                if bomb_cells:
-                    y, x = random.choice(bomb_cells)
-                    self.game_data['revealed'][y][x] = True
-                    
-                    for row in range(3):
-                        for col in range(3):
-                            self.game_data['revealed'][row][col] = True
-
-                    board = self._render_bomb_board()
-                    user_retention_data[self.game_data['user_id']] = user_retention_data.get(self.game_data['user_id'], 0) + 1
-
-                    embed = discord.Embed(
-                        title="☠️ ИГРА ОКОНЧЕНА - БОМБА!",
-                        color=discord.Color.red()
-                    )
-                    embed.add_field(name="Поле:", value=board, inline=False)
-                    embed.add_field(name="Результат:", value="💔 Ставка потеряна", inline=False)
-                    new_bal = await get_balance(interaction.user.id, self.game_data['guild_id'])
-                    embed.set_footer(text=f"Ваш баланс: {new_bal} Лоресиков")
-
-                    await interaction.message.edit(embed=embed, view=None)
-                    logger.info(f"💣 /bombs | {interaction.user} попал на скрытую бомбу при финише и проиграл {self.game_data['bet']}")
-                    return
-        
-        # Игрок выигрывает
         coeff = get_bomb_coefficient(self.game_data['bombs_count'], crystals_found)
         payout = int(self.game_data['bet'] * coeff)
 
@@ -253,7 +227,6 @@ class BombGameView(ui.View):
 
         board = self._render_bomb_board()
 
-        # Определяем сообщение в зависимости от типа финиша
         finish_type = "Все кристаллы найдены!" if auto_win else "Финиш выигрыш!"
 
         embed = discord.Embed(
@@ -495,7 +468,7 @@ class Games(commands.Cog):
             user_retention_data[user_id] = 0
         
         loss_streak = user_retention_data[user_id]
-        win_chance = min(0.70, 0.3 + (loss_streak * 0.08))
+        win_chance = min(0.70, 0.5 + (loss_streak * 0.05))
 
         await update_balance(user_id, guild_id, -ставка)
 
